@@ -243,7 +243,7 @@ the classification of the call.
 
 ## Contributors
 
-This code was written by Chrysanthi Hatzimasoura (chrysanthi.hatzimasoura@dc.gov), Rebecca Johnson (rebecca.johnson@dc.gov), and Kevin H. Wilson.
+This code was written by Chrysanthi Hatzimasoura (chrysanthi.hatzimasoura@dc.gov), Rebecca Johnson (rebecca.johnson@dc.gov), and Ryan T. Moore (@rtm-dc), Kevin H. Wilson.
 
 ## License
 
