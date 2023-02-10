@@ -1,0 +1,7 @@
+# Python cruft
+**/*.pyc
+**/.ipynb_checkpoints
+/.venv
+
+# Editor cruft
+/.vscode

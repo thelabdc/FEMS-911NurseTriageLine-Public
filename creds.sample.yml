@@ -1,0 +1,6 @@
+cad_db:
+  server: SERVER_NAME
+  user: USERNAME
+  password: PASSWORD
+  database: DATABASE
+  port: 1433

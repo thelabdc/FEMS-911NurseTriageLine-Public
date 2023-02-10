@@ -1,0 +1,29 @@
+# Python cruft
+*.pyc
+__pycache__
+.ipynb_checkpoints
+.venv
+.pytest_cache
+.mypy_cache
+
+# R cruft
+.Rhistory
+Rplots.pdf
+
+# Secrets
+creds.yml
+
+# Editor cruft
+.vscode
+.*.swp
+*~
+
+# Mac cruft
+.DS_Store
+
+# Data not to be shared
+/data/private_data/
+/data/data_shared_externally
+/data/intermediate_objects
+/output
+.Rproj.user

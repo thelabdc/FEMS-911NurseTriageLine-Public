@@ -1,0 +1,701 @@
+---
+title: Ambulance Analysis
+author: Rebecca Johnson
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+header-includes:
+- \usepackage{float,booktabs,longtable,tabu,array}
+- \usepackage[small]{caption}
+- \captionsetup[table]{position=bottom}
+- \floatplacement{figure}{H}  #make every figure with caption = h, this was the fix
+- \floatplacement{table}{H}  #make every figure with caption = h, this was the fix
+output:
+pdf_document:
+    fig_caption: yes
+    fig_height: 9
+    fig_width: 9
+    latex_engine: xelatex
+    keep_tex: true
+    keep_md: true
+    toc: true
+geometry: "left=1in,right=1in,top=1in,bottom=1in"
+graphics: yes
+fontsize: 11pt
+---
+
+```{r, include=FALSE, echo=FALSE}
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(MASS)
+library(lubridate)
+library(stargazer)
+library(reshape2)
+library(xtable)
+library(RColorBrewer)
+library(scales)
+library(here)
+
+source(here("src", "R", "000_rmd_setup.R"))
+source(here("src", "R", "000_constants.R"))
+source(here("src", "R", "001_viz_utils.R"))
+```
+
+# 1. Data cleaning
+
+```{r}
+## load data
+df_raw <- read.csv(file.path(INTERMEDIATE_DATA_DIR, "df_forambulanceuse.csv"))
+```
+
+```{r}
+## different types of dispositions in safetypad
+df_initial <- df_raw %>%
+  mutate(
+    femsresponse_char = gsub("\\s+", "", as.character(disposition)),
+    FEMS_response = ifelse(femsresponse_char == "" &
+      event_status %in% c(
+        "NTL Handled - Canceled",
+        "NTL Handled - Clinical Referral",
+        "NTL Handled - RSC"
+      ),
+    "Not in SafetyPAD\n(canceled; clin. referral; or self care)",
+    ifelse(femsresponse_char == "" &
+      !event_status %in% c(
+        "NTL Handled - Canceled",
+        "NTL Handled - Clinical Referral",
+        "NTL Handled - RSC"
+      ),
+    "Not in SafetyPAD\n(Other)",
+    femsresponse_char
+    )
+    ),
+    dispatched_ts = mdy_hm(dispatched)
+  ) %>%
+  dplyr::select(
+    num_1, date, event_status, dispo_broad,
+    FEMS_response, dispatched_ts
+  ) %>%
+  filter(dispo_broad %in% c("NTL control", "NTL treatment")) %>%
+  rename(detailed_timestamp = dispatched_ts) %>%
+  distinct()
+
+# Output proportions of responses to file for supplemental appendix
+tbl <- df_initial %>%
+  filter(FEMS_response != "") %>%
+  arrange(num_1, detailed_timestamp) %>%
+  distinct(num_1, FEMS_response, .keep_all = TRUE) %>%
+  group_by(num_1, dispo_broad) %>%
+  summarize(
+    all_responses = str_replace(
+      paste(FEMS_response, collapse = "; "), "\n", " "
+    ),
+    .groups = "drop") %>%
+  group_by(dispo_broad, all_responses) %>%
+  mutate(numer = n()) %>%
+  group_by(dispo_broad) %>%
+  mutate(denom = n()) %>%
+  group_by(dispo_broad, all_responses) %>%
+  summarize(prop = numer / denom) %>%
+  distinct() %>%
+  filter(prop > 0.01) %>%
+  arrange(dispo_broad, desc(prop)) %>%
+  xtable() %>%
+  print(file = file.path(TABLES_DIR, "recorded_responses.tex"))
+```
+
+```{r}
+sprintf(
+  "There are %s unique ids with %s appearances in the analytic sample",
+  length(unique(df_initial$num_1)),
+  nrow(df_initial)
+)
+```
+
+```{r}
+## see number of rows for each person
+appearances_perid <- df_initial %>%
+  group_by(num_1) %>%
+  summarise(count_appearances = n()) %>%
+  arrange(desc(count_appearances))
+
+## status codes for appearances
+type_appearances_perid <- df_initial %>%
+  group_by(num_1) %>%
+  arrange(detailed_timestamp) %>%
+  summarise(all_appearances = paste(FEMS_response, collapse = "; "))
+
+
+## look at high count id
+# sprintf("Exploring why we have multiple appearances per id")
+# df_initial %>% filter(num_1 == "F180183376")
+
+## merge appearences per id onto main data
+df_initial_wcountappear <- merge(df_initial,
+  appearances_perid,
+  on = "num_1",
+  how = "left"
+)
+
+df_initial_wtypeappear <- merge(df_initial_wcountappear,
+  type_appearances_perid,
+  on = "num_1",
+  how = "left"
+)
+
+
+## sort by time and get
+## latset timestamp observation
+df_analytic <- df_initial_wtypeappear %>%
+  group_by(num_1) %>%
+  arrange(desc(detailed_timestamp), .by_group = TRUE) %>%
+  filter(row_number() == 1) %>%
+  filter(!duplicated(num_1))
+
+
+sprintf(
+  "After taking the latest-time status for each id, there are %s unique ids with %s appearances",
+  length(unique(df_analytic$num_1)),
+  nrow(df_analytic)
+)
+```
+
+```{r}
+df_analytic %>%
+  group_by(FEMS_response) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+dispatch_codes <- setdiff(
+  unique(df_analytic$FEMS_response),
+  c(
+    "Not in SafetyPAD\n(canceled; clin. referral; or self care)",
+    "Not in SafetyPAD\n(Other)"
+  )
+)
+```
+
+```{r}
+## two measures of ambulance use
+df_analytic <- df_analytic %>%
+  mutate(
+    ambulanceuse_lastappearance = ifelse(FEMS_response == "Treated,TransportedbyEMS",
+      1, 0
+    ),
+    ambulanceuse_anyappearance = ifelse(grepl("Treated,TransportedbyEMS", all_appearances),
+      1, 0
+    ),
+    ambulancedispatch_anyappearance = ifelse(FEMS_response %in% dispatch_codes, 1, 0),
+    ambulance_summary = case_when(
+      ambulanceuse_lastappearance == 1 &
+        ambulancedispatch_anyappearance == 1 ~
+      "Amb. dispatched +\ntransported caller",
+      ambulanceuse_lastappearance == 0 &
+        ambulancedispatch_anyappearance == 1 ~ "Amb. dispatched but\nno transport",
+      ambulanceuse_lastappearance == 0 &
+        ambulancedispatch_anyappearance == 0 ~ "No amb. dispatch\nor transport",
+      TRUE ~ "Amb. transport no dispatch"
+    ),
+    event_broad = case_when(
+      grepl("Canceled", event_status) ~ "Cancelled",
+      grepl("Referral", event_status) ~ "Clin. referral",
+      grepl("RSC", event_status) ~ "Self-care",
+      event_status == "Study reject" ~ "",
+      TRUE ~ "Other"
+    ),
+    ambulance_wstatus = ifelse(ambulance_summary == "No dispatch or transport",
+      sprintf("%s:\n%s", ambulance_summary, event_broad),
+      ambulance_summary
+    )
+  )
+
+prop.table(table(df_analytic$dispo_broad, df_analytic$ambulance_wstatus), margin = 1)
+```
+
+```{r}
+## code dispatch no transport
+prop_911response <- data.frame(prop.table(table(df_analytic$dispo_broad, df_analytic$ambulance_wstatus), margin = 1))
+colnames(prop_911response) <- c("dispo_broad", "outcome_911", "proportion")
+bottom_levels <- c(
+  "Dispatch but no transport",
+  "Dispatch and transport"
+)
+top <- c("No dispatch or transport:\nOther")
+prop_911response <- prop_911response %>%
+  filter(dispo_broad %in% c("NTL treatment", "NTL control")) %>%
+  mutate(
+    outcome_911_ordered = factor(outcome_911,
+      levels = c(
+        top, setdiff(
+          unique(prop_911response$outcome_911),
+          c(
+            "Dispatch and transport",
+            "Dispatch but no transport", top
+          )
+        ),
+        bottom_levels
+      ),
+      ordered = TRUE
+    ),
+    percent = proportion * 100,
+    percent_label = sprintf("%s%%", round(percent, 0))
+  )
+
+
+ggplot(prop_911response, aes(
+  x = outcome_911_ordered, y = percent, fill = dispo_broad,
+  group = dispo_broad
+)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black") +
+  theme_new(base_size = 18) +
+  labs(fill = "") +
+  xlab("Group") +
+  ylab("Percent") +
+  scale_fill_manual(values = c(
+    "NTL treatment" = TREATMENT_COLOR,
+    "NTL control" = CONTROL_COLOR
+  )) +
+  guides(fill = guide_legend(ncol = 2)) +
+  theme(legend.position = "bottom") +
+  ylab("Percent of group") +
+  xlab("") +
+  geom_label(aes(
+    x = outcome_911_ordered, y = percent,
+    label = round(percent, 2),
+    group = dispo_broad
+  ),
+  fill = "white",
+  position = position_dodge(width = 1)
+  )
+
+ggsave(file.path(FIGURE_DIR, "detailed_ambulance_perc.pdf"),
+  plot = last_plot(),
+  device = "pdf",
+  width = 12,
+  height = 8
+)
+```
+
+```{r}
+## among treatment callers, event statuses and correspondence
+events_amb <- df_analytic %>%
+  filter(dispo_broad == "NTL treatment") %>%
+  mutate(event_medium = case_when(
+    grepl("Canceled", event_status) ~ "Cancelled",
+    grepl("Referral", event_status) ~ "Clin. referral",
+    grepl("RSC", event_status) ~ "Self-care",
+    grepl("ALS", event_status) ~ "ALS",
+    grepl("BLS", event_status) ~ "BLS",
+    TRUE ~ "Other"
+  )) %>%
+  group_by(event_medium, ambulance_summary) %>%
+  summarise(count = n(), perc = (count / nrow(df_analytic %>% filter(dispo_broad == "NTL treatment"))) * 100) %>%
+  ungroup() %>%
+  mutate(event_ordered = factor(event_medium,
+    levels = c(
+      "ALS",
+      "BLS",
+      "Cancelled",
+      "Clin. referral",
+      "Self-care",
+      "Other"
+    ),
+    ordered = TRUE
+  ))
+```
+
+```{r}
+ggplot(events_amb, aes(x = event_ordered, y = perc, fill = ambulance_summary)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black") +
+  theme_new(base_size = 16) +
+  theme(legend.position = c(0.7, 0.7)) +
+  xlab("Call response code") +
+  ylab("Percent of treatment group\n(sums to 100 across all bars)") +
+  scale_fill_manual(values = c(
+    "#272932", "#427EA8",
+    "#B6C2D9"
+  )) +
+  labs(fill = "")
+
+ggsave(file.path(FIGURE_DIR, "txgroup_callresponse_vamb.pdf"),
+  plot = last_plot(),
+  device = "pdf",
+  width = 12,
+  height = 8
+)
+```
+
+```{r}
+## write file for use in updated Medicaid dx analysis
+write.csv(df_analytic, file.path(INTERMEDIATE_DATA_DIR, "callresponse_forposttx.csv"),
+  row.names = FALSE
+)
+```
+
+# 2. Ambulance use
+
+## 2.1 Descriptive across entire study period
+
+```{r}
+prop_ambulance_last <- df_analytic %>%
+  group_by(dispo_broad, ambulanceuse_lastappearance) %>%
+  summarise(count_used = n()) %>%
+  left_join(df_analytic %>% group_by(dispo_broad) %>% summarise(total_count = n())) %>%
+  mutate(prop_use_last = count_used / total_count) %>%
+  dplyr::select(
+    dispo_broad, ambulanceuse_lastappearance, prop_use_last, count_used,
+    total_count
+  ) %>%
+  rename(ambulanceuse = ambulanceuse_lastappearance)
+prop_ambulance_any <- df_analytic %>%
+  group_by(dispo_broad, ambulanceuse_anyappearance) %>%
+  summarise(count_used = n()) %>%
+  left_join(df_analytic %>% group_by(dispo_broad) %>% summarise(total_count = n())) %>%
+  mutate(prop_use_any = count_used / total_count) %>%
+  dplyr::select(dispo_broad, ambulanceuse_anyappearance, prop_use_any) %>%
+  rename(ambulanceuse = ambulanceuse_anyappearance)
+
+
+prop_ambulance_either <- merge(prop_ambulance_last, prop_ambulance_any,
+  by = c("dispo_broad", "ambulanceuse")
+) %>%
+  mutate(ambulanceuse_descriptive = factor(ambulanceuse,
+    levels = c(0, 1),
+    labels = c(
+      "No ambulance\ntransport for call",
+      "Ambulance\ntransport for call"
+    )
+  ))
+
+
+prop_ambulance_last %>%
+  mutate(ambulance_transport = ifelse(ambulanceuse == 0,
+    "No transport",
+    "Transport"
+  )) %>%
+  dplyr::select(dispo_broad, ambulance_transport, count_used, total_count)
+```
+
+```{r}
+## similar for dispatch
+prop_dispatch_any <- df_analytic %>%
+  group_by(dispo_broad, ambulancedispatch_anyappearance) %>%
+  summarise(count_used = n()) %>%
+  left_join(df_analytic %>% group_by(dispo_broad) %>% summarise(total_count = n())) %>%
+  mutate(prop_use_any = count_used / total_count) %>%
+  dplyr::select(dispo_broad, ambulancedispatch_anyappearance, prop_use_any) %>%
+  rename(ambulancedispatch = ambulancedispatch_anyappearance) %>%
+  mutate(ambulancedispatch_descriptive = factor(ambulancedispatch,
+    levels = c(0, 1),
+    labels = c(
+      "No ambulance\ndispatch for call",
+      "Ambulance\ndispatch for call"
+    )
+  ))
+```
+
+```{r}
+
+## Main text figure on prop by group
+ggplot(prop_ambulance_either, aes(
+  x = ambulanceuse_descriptive, y = prop_use_last,
+  fill = dispo_broad, group = dispo_broad
+)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  xlab("") +
+  ylab("Proportion of each group") +
+  labs(fill = "") +
+  scale_fill_manual(values = c(
+    "NTL treatment" = TREATMENT_COLOR,
+    "NTL control" = CONTROL_COLOR
+  )) +
+  geom_label(aes(x = ambulanceuse_descriptive, y = prop_use_last, label = round(prop_use_last, 2)),
+    position = position_dodge(width = 1), size = 6, fill = "white"
+  ) +
+  theme_new(base_size = 24) +
+  theme(
+    legend.position = c(0.3, 0.9),
+    legend.background = element_blank()
+  )
+
+## save results
+ggsave(file.path(FIGURE_DIR, "propambulance_laststatus.pdf"),
+  plot = last_plot(),
+  device = "pdf",
+  width = 12,
+  height = 8
+)
+```
+
+```{r}
+## Appendix figure on prop by group
+ggplot(prop_ambulance_either, aes(
+  x = ambulanceuse_descriptive, y = prop_use_any,
+  fill = dispo_broad, group = dispo_broad
+)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.8) +
+  xlab("") +
+  ylab("Proportion of each group") +
+  labs(fill = "") +
+  scale_fill_manual(values = c(
+    "NTL treatment" = TREATMENT_COLOR,
+    "NTL control" = CONTROL_COLOR
+  )) +
+  geom_label(aes(x = ambulanceuse_descriptive, y = prop_use_any, label = round(prop_use_any, 2)),
+    position = position_dodge(width = 1), size = 6, fill = "white"
+  ) +
+  theme_new(base_size = 24) +
+  theme(
+    legend.position = c(0.3, 0.9),
+    legend.background = element_blank()
+  )
+
+## save results
+ggsave(file.path(FIGURE_DIR, "propambulance_any.pdf"),
+  plot = last_plot(),
+  device = "pdf",
+  width = 12,
+  height = 8
+)
+```
+
+```{r}
+## Main text figure on prop by group
+ggplot(prop_dispatch_any, aes(
+  x = ambulancedispatch_descriptive, y = prop_use_any,
+  fill = dispo_broad, group = dispo_broad
+)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.8) +
+  xlab("") +
+  ylab("Proportion of each group") +
+  labs(fill = "") +
+  scale_fill_manual(values = c(
+    "NTL treatment" = TREATMENT_COLOR,
+    "NTL control" = CONTROL_COLOR
+  )) +
+  geom_label(aes(x = ambulancedispatch_descriptive, y = prop_use_any, label = round(prop_use_any, 2)),
+    position = position_dodge(width = 1), size = 6, fill = "white"
+  ) +
+  theme_new(base_size = 24) +
+  theme(
+    legend.position = c(0.3, 0.9),
+    legend.background = element_blank()
+  )
+
+## save results
+ggsave(file.path(FIGURE_DIR, "propamb_dispatch.pdf"),
+  plot = last_plot(),
+  device = "pdf",
+  width = 12,
+  height = 8
+)
+```
+
+## 2.2 regressions across entire study period
+
+Language on controls from PAP:
+
+If baseline balance analysis justifies their inclusion we will include pre-treatment covariates for NTL-eligible callers who have a 911 calling history, and indicators for the day of the pilot period.
+
+```{r}
+run_regs <- function(data, outcome_varname, treatment_varname = "treatment",
+                     include_dayFE = FALSE, dayFE_name) {
+
+  ##
+  if (include_dayFE == FALSE) {
+    reg_formula <- formula(sprintf("%s ~ %s", outcome_varname, treatment_varname))
+    reg_results <- glm(reg_formula, data = data, family = "binomial")
+    return(reg_results)
+  } else {
+    reg_formula <- formula(sprintf(
+      "%s ~ %s + factor(%s)", outcome_varname, treatment_varname,
+      dayFE_name
+    ))
+    reg_results <- glm(reg_formula, data = data, family = "binomial")
+    return(reg_results)
+  }
+}
+```
+
+```{r}
+df_analytic <- df_analytic %>%
+  mutate(
+    treatment = ifelse(dispo_broad == "NTL treatment", 1, 0),
+    day_rounded = as.Date(date, format = "%Y-%m-%d")
+  )
+
+ambulancemain_nocontrols <- run_regs(data = df_analytic, outcome_varname = "ambulanceuse_lastappearance")
+ambulancerobust_nocontrols <- run_regs(data = df_analytic, outcome_varname = "ambulanceuse_anyappearance")
+ambulancedispatch_nocontrols <- run_regs(data = df_analytic, outcome_varname = "ambulancedispatch_anyappearance")
+```
+
+```{r}
+stargazer(
+  ambulancemain_nocontrols,
+  ambulancerobust_nocontrols,
+  ambulancedispatch_nocontrols,
+  title = "Effect of Nurse Triage Line on Ambulance Dispatches and Transport (logistic regression)",
+  label = "tab:amb_full_results",
+  dep.var.labels = c("Amb. transport (last status)", "Amb. transport (any status)", "Amb. dispatch (any status)"),
+  covariate.labels = c("Treatment", "Constant"),
+  omit = "day_rounded",
+  font.size = "scriptsize",
+  digits = 3,
+  out = file.path(TABLES_DIR, "regression_ambulance_main.tex")
+)
+```
+
+## 2.3 Visualizing
+
+Not using predicted probabilities code for now
+
+For now, showing raw means and p-value
+
+```{r}
+prop_forgraph <- df_analytic %>%
+  group_by(treatment) %>%
+  summarise(
+    transport = mean(ambulanceuse_lastappearance),
+    dispatch = mean(ambulancedispatch_anyappearance)
+  ) %>%
+  ungroup() %>%
+  mutate(treatment_descriptive = ifelse(treatment == 1,
+    "NTL treatment",
+    "NTL control"
+  )) %>%
+  dplyr::select(-treatment) %>%
+  melt(, id.vars = "treatment_descriptive") %>%
+  mutate(
+    variable_descriptive = ifelse(variable == "transport",
+      "Amb. transport\n",
+      "Amb. dispatch\n(includes transport)"
+    ),
+    perc = value * 100
+  )
+
+ggplot(prop_forgraph, aes(
+  x = variable_descriptive, y = perc,
+  group = treatment_descriptive, fill = treatment_descriptive
+)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_new(base_size = 24) +
+  scale_fill_manual(values = c(
+    "NTL treatment" = TREATMENT_COLOR,
+    "NTL control" = CONTROL_COLOR
+  )) +
+  labs(fill = "") +
+  theme(
+    legend.position = c(0.75, 0.9),
+    legend.background = element_blank()
+  ) +
+  xlab("") +
+  ylab("Percentage of group") +
+  scale_y_continuous(breaks = pretty_breaks(n = 10)) +
+  annotate("text", x = c(1.2, 2.2), y = c(60, 48), label = "p < 0.001", size = 6)
+
+ggsave(file.path(FIGURE_DIR, "ambuse_maintext.pdf"),
+  plot = last_plot(),
+  device = "pdf",
+  width = 12,
+  height = 8
+)
+```
+
+## 2.4. Regressions separately for each month
+
+```{r}
+df_analytic <- df_analytic %>%
+  mutate(month = format(as.Date(date), "%Y-%m"))
+```
+
+```{r}
+reg_bymonth <- function(data, month_name) {
+  filtered_data <- data %>% filter(month == month_name)
+  reg_results <- run_regs(filtered_data, outcome_varname = "ambulanceuse_lastappearance")
+  return(reg_results)
+}
+```
+
+```{r}
+all_months <- unique(df_analytic$month)
+
+
+regs_allmonths <- lapply(all_months, reg_bymonth, data = df_analytic)
+```
+
+```{r}
+summary(regs_allmonths[[1]])$coefficients
+```
+
+```{r}
+treatment_effect <- lapply(regs_allmonths, function(x) coefficients(x)["treatment"])
+se <- lapply(regs_allmonths, function(x) summary(x)$coefficients["treatment", 2])
+pval <- lapply(regs_allmonths, function(x) summary(x)$coefficients["treatment", 4])
+summarize_estimates_bymonth <- data.frame(
+  month = all_months, treatment_effect = unlist(treatment_effect),
+  se = unlist(se), pval_uncorrected = unlist(pval)
+) %>%
+  arrange(month) %>%
+  mutate(
+    lower = treatment_effect - 1.96 * se,
+    upper = treatment_effect + 1.96 * se
+  )
+summarize_estimates_bymonth
+
+ggplot(summarize_estimates_bymonth, aes(x = factor(month), y = treatment_effect)) +
+  geom_point() +
+  geom_errorbar(aes(x = factor(month), ymin = lower, ymax = upper),
+    width = 0.5
+  ) +
+  theme_new(base_size = 24) +
+  ylim(-3, 0.1) +
+  coord_flip() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  xlab("Month") +
+  ylab("Treatment effect on call likelihood\nof ambulance use\n(negative: treatment group\nhad lower use)")
+
+ggsave(file.path(FIGURE_DIR, "coef_amb_bymonth.pdf"),
+  plot = last_plot(),
+  device = "pdf",
+  width = 12,
+  height = 8
+)
+```
+
+```{r}
+pvals_corrected <- p.adjust(summarize_estimates_bymonth$pval_uncorrected,
+  method = "bonferroni",
+  n = length(summarize_estimates_bymonth$pval_uncorrected)
+)
+
+summarize_estimates_bymonth$pvals_corrected <- pvals_corrected
+
+summarize_estimates_bymonth %>%
+  dplyr::select(month, treatment_effect, pval_uncorrected, pvals_corrected) %>%
+  rename(
+    Month = month,
+    `Treatment effect` = treatment_effect,
+    `p-value (uncorrected)` = pval_uncorrected,
+    `p-value (corrected)` = pvals_corrected
+  ) %>%
+  xtable(
+    caption = "Treatment effects on ambulance use by month: coefficients, p values, and Bonferonni-corrected p values",
+    label = "tab:logit_bymonth",
+    # align = c("l", "r", "r", "r"),
+    digits = c(3, 4, 4, 10, 10)
+  ) %>%
+  print(
+    include.rownames = FALSE,
+    caption.placement = "top",
+    file = file.path(TABLES_DIR, "bonferonni_pvalues.tex")
+  )
+
+# print(xtable(summarize_estimates_bymonth %>% dplyr::select(
+#   month, treatment_effect, pval_uncorrected,
+#   pvals_corrected
+# ),
+# digits = c(3, 4, 4, 10, 10)
+# ),
+# include.rownames = FALSE
+# )
+```
+
